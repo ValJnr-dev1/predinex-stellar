@@ -1,32 +1,19 @@
 /**
- * Positions API Route (Issues #1425, #1445).
+ * Positions API Route (Issue #1425).
  *
  * GET /api/positions
- *   Query parameters (two styles, both supported):
- *
- *   page/pageSize style (Issue #1445 — preferred for new clients):
- *     page     – 1-based page number (default 1)
- *     pageSize – items per page (default 20, clamped to 100)
- *
- *   limit/offset style (Issue #1425 — kept for backward compatibility):
- *     limit    – page size (default 20, max 100)
- *     offset   – zero-based start index (default 0)
- *
- *   If both styles are present, page/pageSize takes precedence.
- *
- *   Filter parameters (all optional):
- *     market  – filter by pool id
- *     account – filter by Stellar account address
- *     outcome – filter by outcome index
+ *   Query parameters:
+ *     market  – optional, filter by pool id
+ *     account – optional, filter by Stellar account address
+ *     outcome – optional, filter by outcome index
+ *     limit   – page size (default 20, max 100)
+ *     offset  – zero-based page start (default 0)
  *
  * Response envelope:
  *   {
  *     success:    true,
  *     data:       IndexedPosition[],
- *     pagination: {
- *       total, limit, offset, count, hasMore, nextOffset, prevOffset,
- *       page, pageSize        ← always present (Issue #1445)
- *     },
+ *     pagination: { total, limit, offset, count, hasMore, nextOffset, prevOffset },
  *     timestamp:  string (ISO)
  *   }
  *
@@ -41,11 +28,7 @@
  */
 
 import { Router, Request, Response } from 'express';
-import {
-  buildPageMeta,
-  parsePagination,
-  parsePagePagination,
-} from '../services/pagination.js';
+import { buildPageMeta, parsePagination } from '../services/pagination.js';
 import { withSpan } from '../middleware/tracing.js';
 import type {
   IndexedPosition,
@@ -254,21 +237,10 @@ export function createPositionsRouter(source: PositionSource = defaultPositionSo
    *
    * Returns a paginated list of indexed positions. Supports optional
    * `market`, `account`, and `outcome` filters.
-   *
-   * Accepts either `page`/`pageSize` (Issue #1445) or the legacy
-   * `limit`/`offset` style (Issue #1425).  When both are present,
-   * `page`/`pageSize` takes precedence.
    */
   router.get('/', async (req: Request, res: Response) => {
-    const query = req.query as Record<string, unknown>;
-
     // 1. Parse + validate pagination params.
-    //    page/pageSize takes precedence when either key is present.
-    const usesPageStyle = query.page !== undefined || query.pageSize !== undefined;
-    const paginationResult = usesPageStyle
-      ? parsePagePagination(query)
-      : parsePagination(query);
-
+    const paginationResult = parsePagination(req.query as Record<string, unknown>);
     if (!paginationResult.ok) {
       res.status(400).json({
         success: false,
@@ -283,7 +255,7 @@ export function createPositionsRouter(source: PositionSource = defaultPositionSo
     }
 
     // 2. Parse + validate filter params.
-    const filterResult = parsePositionFilter(query);
+    const filterResult = parsePositionFilter(req.query as Record<string, unknown>);
     if (!filterResult.ok) {
       res.status(400).json({
         success: false,
