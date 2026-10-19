@@ -13,6 +13,7 @@ mod benchmark_tests;
 mod benchmarks;
 mod bet_management_tests;
 mod budget_planner;
+pub mod audit_log;
 // #1234 — The planner types are re-exported at the crate root so they are part
 // of the contract's public interface. While the module was gated behind
 // `#![cfg(test)]` these were unreachable from any build of the contract.
@@ -126,6 +127,13 @@ fn emit_protocol_fee_set(env: &Env, caller: Address, old_fee_bps: u32, fee_bps: 
     env.events().publish(
         (Symbol::new(env, "protocol_fee_set"), event_version(env)),
         (caller, old_fee_bps, fee_bps),
+    );
+}
+
+fn emit_protocol_fee_cap_set(env: &Env, caller: Address, old_cap_bps: u32, cap_bps: u32) {
+    env.events().publish(
+        (Symbol::new(env, "protocol_fee_cap_set"), event_version(env)),
+        (caller, old_cap_bps, cap_bps),
     );
 }
 
@@ -774,6 +782,52 @@ fn emit_pool_disputed(env: &Env, pool_id: u32, caller: Address, disputed_outcome
     );
 }
 
+/// #1416 — Publish the `resolution_finalized` domain event.
+fn emit_resolution_finalized(
+    env: &Env,
+    pool_id: u32,
+    winning_outcome: u32,
+    finalizer: Option<Address>,
+    auto: bool,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "resolution_finalized"),
+            event_version(env),
+            pool_id,
+        ),
+        ResolutionFinalizedEvent {
+            pool_id,
+            winning_outcome,
+            finalizer,
+            auto,
+        },
+    );
+}
+
+/// #1416 — Publish the `resolution_challenged` domain event.
+fn emit_resolution_challenged(
+    env: &Env,
+    pool_id: u32,
+    challenger: Address,
+    disputed_outcome: u32,
+    timestamp: u64,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, "resolution_challenged"),
+            event_version(env),
+            pool_id,
+        ),
+        ResolutionChallengedEvent {
+            pool_id,
+            challenger,
+            disputed_outcome,
+            timestamp,
+        },
+    );
+}
+
 fn emit_pool_ext_metadata_set(env: &Env, pool_id: u32, creator: Address) {
     env.events().publish(
         (
@@ -991,7 +1045,9 @@ fn event_version(env: &Env) -> Symbol {
     Symbol::new(env, EVENT_SCHEMA_VERSION)
 }
 
-// Dispute window: 7 days in seconds (configurable in future)
+// Recommended dispute-window duration (7 days). Used as the default for the
+// cross-chain dispute window. For regular pools the dispute window defaults to
+// 0 (immediately final); the freeze admin enables it via `set_dispute_window`.
 const DISPUTE_WINDOW_SECS: u64 = 7 * 24 * 3600;
 
 // Precision multiplier for LP fee-per-share accumulator (avoids rounding to zero)
@@ -1038,6 +1094,9 @@ pub enum DataKey {
     /// #167 — protocol fee in basis points. Set by the treasury recipient via
     /// `set_protocol_fee`; defaults to 200 (2%) when absent.
     ProtocolFee,
+    /// Maximum protocol fee accepted by governance setters. Missing values
+    /// retain the 1,000 bps compatibility ceiling for existing deployments.
+    ProtocolFeeCap,
     /// #158 — per-pool claim / payout progress for winner claims.
     PoolPayoutState(u32),
     /// #195 — floor(bps × pool volume) protocol fee for this market (set at settlement).
@@ -1248,6 +1307,15 @@ pub enum DataKey {
     /// `get_user_claim_history` page by a stable absolute sequence offset
     /// instead of a raw storage index that shifts when old entries are trimmed.
     UserClaimHistorySeq(Address),
+    /// #1416 — Deadline (ledger timestamp) after which a `ResolutionPending`
+    /// pool can be finalized to `Settled`. Set at settlement time to
+    /// `settlement_time + dispute_window`.
+    PoolResolutionDeadline(u32),
+    /// #1416 — Recorded challenges against a pending resolution. Stores a
+    /// `Vec<Challenge>` so the UI and indexers can display who challenged and
+    /// when. Each entry is appended when [`dispute_pool`](Self::dispute_pool) is
+    /// called on a `ResolutionPending` pool.
+    PoolChallenges(u32),
 }
 
 // #189 — TTL bump policy for persistent storage entries.
@@ -1270,6 +1338,20 @@ const POOL_BUMP_THRESHOLD: u32 = LEDGERS_PER_DAY * 25; // trigger bump when < 25
 const PROTOCOL_FEE_MIN_BPS: u32 = 0;
 const PROTOCOL_FEE_MAX_BPS: u32 = 1000;
 const PROTOCOL_FEE_DEFAULT_BPS: u32 = 200;
+
+fn protocol_fee_cap_bps(env: &Env) -> u32 {
+    let persistent = env.storage().persistent();
+    if persistent.has(&DataKey::ProtocolFeeCap) {
+        persistent.extend_ttl(
+            &DataKey::ProtocolFeeCap,
+            POOL_BUMP_THRESHOLD,
+            POOL_BUMP_TARGET,
+        );
+    }
+    persistent
+        .get::<_, u32>(&DataKey::ProtocolFeeCap)
+        .unwrap_or(PROTOCOL_FEE_MAX_BPS)
+}
 
 /// Maximum bet fee rate in basis points. Matches the protocol fee cap so that
 /// a privileged key cannot silently confiscate an outsized share of bets.
@@ -1507,6 +1589,12 @@ pub enum ContractError {
     TransferBalanceMismatch = 92,
     /// TWAP lookback period must be greater than zero.
     InvalidTwapPeriod = 93,
+    /// #1416 — A claim or finalization was attempted on a pool whose resolution
+    /// is still within the dispute window and has not yet been finalized.
+    ResolutionNotFinal = 94,
+    /// #1416 — `finalize_resolution` was called on a pool that is not in the
+    /// `ResolutionPending` status (already settled, disputed, or still open).
+    ResolutionNotPending = 95,
 }
 
 /// #176 — Settlement source tag indicating who initiated pool settlement.
@@ -1648,6 +1736,15 @@ pub enum PoolStatus {
     Cancelled,
     /// #355 — Pool parameters are stored but betting opens at this timestamp.
     Scheduled(u64),
+    /// #1416 — A winning outcome has been declared but the resolution is not
+    /// yet final. The pool enters this state immediately after settlement and
+    /// remains here until the configured dispute window elapses. During the
+    /// window any authorised party may challenge the resolution, transitioning
+    /// the pool to [`Disputed`](Self::Disputed). Once the window closes without
+    /// a challenge, [`finalize_resolution`](Self::finalize_resolution) (or an
+    /// automatic check during a claim) transitions the pool to
+    /// [`Settled`](Self::Settled), after which winner claims proceed normally.
+    ResolutionPending(u32),
 }
 
 /// #718 — Category for grouping prediction pools by topic for discovery.
@@ -2425,6 +2522,44 @@ pub struct BridgeTransferEvent {
     pub target_chain: ChainId,
 }
 
+/// #1416 — A recorded challenge against a pending pool resolution. Appended to
+/// `PoolChallenges` when a party calls [`dispute_pool`](PredinexContract::dispute_pool)
+/// on a pool in [`ResolutionPending`](PoolStatus::ResolutionPending) status.
+#[derive(Clone, PartialEq, Debug)]
+#[contracttype]
+pub struct Challenge {
+    /// Address that raised the challenge.
+    pub challenger: Address,
+    /// Ledger timestamp at which the challenge was recorded.
+    pub timestamp: u64,
+    /// The outcome index that was under dispute (the pending resolution).
+    pub disputed_outcome: u32,
+}
+
+/// #1416 — Event payload emitted when a resolution is finalized (transitions
+/// from `ResolutionPending` to `Settled`).
+#[derive(Clone)]
+#[contracttype]
+pub struct ResolutionFinalizedEvent {
+    pub pool_id: u32,
+    pub winning_outcome: u32,
+    pub finalizer: Option<Address>,
+    /// Whether finalization was triggered automatically by a claim path
+    /// (`true`) or by an explicit `finalize_resolution` call (`false`).
+    pub auto: bool,
+}
+
+/// #1416 — Event payload emitted when a challenge is recorded against a
+/// pending resolution.
+#[derive(Clone)]
+#[contracttype]
+pub struct ResolutionChallengedEvent {
+    pub pool_id: u32,
+    pub challenger: Address,
+    pub disputed_outcome: u32,
+    pub timestamp: u64,
+}
+
 /// #714 — LP position for a user in a specific pool.
 #[derive(Clone)]
 #[contracttype]
@@ -2522,11 +2657,29 @@ impl PredinexContract {
         env.storage().persistent().set(&DataKey::Treasury, &0i128);
         env.storage().persistent().set(&DataKey::TreasuryToken(token.clone()), &0i128);
         env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProtocolFeeCap, &PROTOCOL_FEE_MAX_BPS);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ProtocolFeeCap,
+            POOL_BUMP_THRESHOLD,
+            POOL_BUMP_TARGET,
+        );
         emit_admin_set(&env, None, admin);
         // #191 — persist the contract state schema version on initialization.
         env.storage().persistent().set(
             &DataKey::ContractVersion,
             &Symbol::new(&env, CONTRACT_STATE_VERSION),
+        );
+        audit_log::append(
+            &env,
+            admin.clone(),
+            Symbol::new(&env, "initialize"),
+            audit_log::AdminActionDetail::Initialize(audit_log::AuditInitialize {
+                token,
+                treasury_recipient,
+                admin,
+            }),
         );
         Ok(())
     }
@@ -2575,6 +2728,16 @@ impl PredinexContract {
             fee_rate.into(),
             fee_recipient.clone(),
         );
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_fee_config"),
+            audit_log::AdminActionDetail::SetFeeConfig(audit_log::AuditSetFeeConfig {
+                old_fee_rate,
+                new_fee_rate: fee_rate,
+                fee_recipient,
+            }),
+        );
         Ok(())
     }
 
@@ -2615,6 +2778,12 @@ impl PredinexContract {
             .unwrap_or(0);
         env.storage().persistent().set(&DataKey::CreationFee, &fee);
         emit_creation_fee_set(&env, old_fee, fee);
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_creation_fee"),
+            audit_log::AdminActionDetail::SetCreationFee(audit_log::AuditSetCreationFee { before: old_fee, after: fee }),
+        );
         Ok(())
     }
 
@@ -2657,7 +2826,13 @@ impl PredinexContract {
             env.storage().persistent().remove(&key);
         }
 
-        emit_creation_fee_exemption_set(&env, account, exempt);
+        emit_creation_fee_exemption_set(&env, account.clone(), exempt);
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_creation_fee_exemption"),
+            audit_log::AdminActionDetail::SetCreationFeeExemption(audit_log::AuditSetCreationFeeExemption { account, exempt }),
+        );
         Ok(())
     }
 
@@ -2672,7 +2847,7 @@ impl PredinexContract {
     /// #167 — Set the protocol fee in basis points.
     ///
     /// Only the treasury recipient may call this. The fee must be within
-    /// [PROTOCOL_FEE_MIN_BPS, PROTOCOL_FEE_MAX_BPS] (0–1000 basis points, i.e., 0–10%).
+    /// [PROTOCOL_FEE_MIN_BPS, get_max_protocol_fee_bps()].
     /// The fee applies to future settlements and claims; existing settled pools
     /// are not affected.
     ///
@@ -2682,11 +2857,11 @@ impl PredinexContract {
     ///
     /// # Panics
     /// * "Unauthorized" – if caller is not the treasury recipient
-    /// * "Fee out of bounds" – if fee_bps is outside [0, 1000]
+    /// * `FeeOutOfBounds` – if fee_bps is outside the configured range
     pub fn set_protocol_fee(env: Env, caller: Address, fee_bps: u32) -> Result<(), ContractError> {
         caller.require_auth();
         Self::require_treasury_recipient(&env, &caller)?;
-        if !(PROTOCOL_FEE_MIN_BPS..=PROTOCOL_FEE_MAX_BPS).contains(&fee_bps) {
+        if !(PROTOCOL_FEE_MIN_BPS..=protocol_fee_cap_bps(&env)).contains(&fee_bps) {
             return Err(ContractError::FeeOutOfBounds);
         }
         let old_fee_bps: u32 = env
@@ -2698,7 +2873,13 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::ProtocolFee, &fee_bps);
 
-        emit_protocol_fee_set(&env, caller, old_fee_bps, fee_bps);
+        emit_protocol_fee_set(&env, caller.clone(), old_fee_bps, fee_bps);
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_protocol_fee"),
+            audit_log::AdminActionDetail::SetProtocolFee(audit_log::AuditSetProtocolFee { before: old_fee_bps, after: fee_bps }),
+        );
         Ok(())
     }
 
@@ -2717,6 +2898,61 @@ impl PredinexContract {
             .unwrap_or(PROTOCOL_FEE_DEFAULT_BPS)
     }
 
+    /// Set the maximum protocol settlement fee accepted by fee governance.
+    ///
+    /// The cap cannot exceed the protocol hard ceiling of 1,000 bps. Existing
+    /// flat and volume-tier fees must fit under the new cap. Only the admin or
+    /// treasury recipient may change this setting.
+    pub fn set_max_protocol_fee_bps(
+        env: Env,
+        caller: Address,
+        cap_bps: u32,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::require_admin_or_treasury_recipient(&env, &caller)?;
+        if cap_bps > PROTOCOL_FEE_MAX_BPS {
+            return Err(ContractError::FeeOutOfBounds);
+        }
+
+        let current_fee = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::ProtocolFee)
+            .unwrap_or(PROTOCOL_FEE_DEFAULT_BPS);
+        if current_fee > cap_bps {
+            return Err(ContractError::FeeOutOfBounds);
+        }
+        let tiers: Option<Vec<FeeTier>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VolumeFeeTiers);
+        if tiers
+            .map(|configured| configured.iter().any(|tier| tier.fee_bps > cap_bps))
+            .unwrap_or(false)
+        {
+            return Err(ContractError::FeeOutOfBounds);
+        }
+
+        let old_cap_bps = protocol_fee_cap_bps(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProtocolFeeCap, &cap_bps);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ProtocolFeeCap,
+            POOL_BUMP_THRESHOLD,
+            POOL_BUMP_TARGET,
+        );
+        emit_protocol_fee_cap_set(&env, caller, old_cap_bps, cap_bps);
+        Ok(())
+    }
+
+    /// Return the configured maximum settlement fee in basis points.
+    ///
+    /// Older contract instances retain the historic 1,000 bps hard ceiling.
+    pub fn get_max_protocol_fee_bps(env: Env) -> u32 {
+        protocol_fee_cap_bps(&env)
+    }
+
     /// Configure volume-based protocol fee tiers.
     ///
     /// Tiers let larger markets pay a reduced (or otherwise different) fee than
@@ -2733,7 +2969,7 @@ impl PredinexContract {
     /// * at most `MAX_FEE_TIERS` (5) tiers
     /// * every `volume_threshold >= 0`
     /// * strictly ascending `volume_threshold` (no duplicates, defined order)
-    /// * every `fee_bps` within `[PROTOCOL_FEE_MIN_BPS, PROTOCOL_FEE_MAX_BPS]`
+    /// * every `fee_bps` within `[PROTOCOL_FEE_MIN_BPS, get_max_protocol_fee_bps()]`
     ///
     /// Emits `volume_fee_tiers_set` with the caller and the full set of tiers
     /// now configured (empty when tiers were cleared).
@@ -2754,7 +2990,7 @@ impl PredinexContract {
             if tier.volume_threshold < 0 {
                 return Err(ContractError::FeeOutOfBounds);
             }
-            if !(PROTOCOL_FEE_MIN_BPS..=PROTOCOL_FEE_MAX_BPS).contains(&tier.fee_bps) {
+            if !(PROTOCOL_FEE_MIN_BPS..=protocol_fee_cap_bps(&env)).contains(&tier.fee_bps) {
                 return Err(ContractError::FeeOutOfBounds);
             }
             if let Some(prev) = prev_threshold {
@@ -2778,7 +3014,13 @@ impl PredinexContract {
             );
         }
 
-        emit_volume_fee_tiers_set(&env, caller, tiers);
+        emit_volume_fee_tiers_set(&env, caller.clone(), tiers.clone());
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_volume_fee_tiers"),
+            audit_log::AdminActionDetail::SetVolumeFeeTiers(audit_log::AuditSetVolumeFeeTiers { tier_count: tiers.len() }),
+        );
         Ok(())
     }
 
@@ -2797,6 +3039,7 @@ impl PredinexContract {
     /// volume is below the first tier; otherwise the `fee_bps` of the highest
     /// tier whose threshold is `<= volume`.
     fn resolve_fee_bps_for_volume(env: &Env, volume: i128) -> u32 {
+        let _ = protocol_fee_cap_bps(env);
         let tiers = env
             .storage()
             .persistent()
@@ -2860,9 +3103,15 @@ impl PredinexContract {
     ///
     /// Both `claim_winnings_internal` and `claim_multi_asset_winnings` use the
     /// same status mapping so Frozen/Disputed/Cancelled/Settled handling cannot diverge.
+    ///
+    /// #1416 — `ResolutionPending` is rejected with `ResolutionNotFinal`. In
+    /// practice the claim paths call `try_auto_finalize` first, so a
+    /// `ResolutionPending` pool reaching here means the dispute window has not
+    /// yet elapsed.
     fn claim_winning_outcome(pool: &Pool) -> Result<u32, ContractError> {
         match pool.status {
             PoolStatus::Settled(o) => Ok(o),
+            PoolStatus::ResolutionPending(_) => Err(ContractError::ResolutionNotFinal),
             PoolStatus::Frozen => Err(ContractError::PoolIsFrozen),
             PoolStatus::Disputed => Err(ContractError::PoolIsDisputed),
             PoolStatus::Cancelled => Err(ContractError::PoolIsCancelled),
@@ -2979,6 +3228,18 @@ impl PredinexContract {
         );
 
         emit_pool_bet_limits_set(&env, pool_id, old_min_bet, old_max_bet, min_bet, max_bet);
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_pool_bet_limits"),
+            audit_log::AdminActionDetail::SetPoolBetLimits(audit_log::AuditSetPoolBetLimits {
+                pool_id,
+                old_min: old_min_bet,
+                old_max: old_max_bet,
+                new_min: min_bet,
+                new_max: max_bet,
+            }),
+        );
         Ok(())
     }
 
@@ -3042,6 +3303,16 @@ impl PredinexContract {
             max_pool_size,
             large_pool_threshold,
             cooling_period_secs,
+        );
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_circuit_breaker_config"),
+            audit_log::AdminActionDetail::SetCircuitBreakerConfig(audit_log::AuditSetCircuitBreakerConfig {
+                max_pool_size,
+                large_pool_threshold,
+                cooling_period_secs,
+            }),
         );
         Ok(())
     }
@@ -3110,6 +3381,15 @@ impl PredinexContract {
             old_window_secs,
             max_bets_per_window,
             window_secs,
+        );
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_rate_limit_config"),
+            audit_log::AdminActionDetail::SetRateLimitConfig(audit_log::AuditSetRateLimitConfig {
+                max_bets_per_window,
+                window_secs,
+            }),
         );
         Ok(())
     }
@@ -3250,6 +3530,17 @@ impl PredinexContract {
             weekly_loss_limit,
             large_bet_cooldown_secs,
             large_bet_threshold,
+        );
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_user_exposure_config"),
+            audit_log::AdminActionDetail::SetUserExposureConfig(audit_log::AuditSetUserExposureConfig {
+                max_exposure_per_pool_bps,
+                max_bet_per_tx: max_bet_per_transaction,
+                daily_loss_limit,
+                weekly_loss_limit,
+            }),
         );
         Ok(())
     }
@@ -5635,7 +5926,9 @@ impl PredinexContract {
         // have not yet opened for betting and cancellation would bypass the
         // scheduled lifecycle.
         match pool.status {
-            PoolStatus::Settled(_) => return Err(ContractError::PoolAlreadySettled),
+            PoolStatus::Settled(_) | PoolStatus::ResolutionPending(_) => {
+                return Err(ContractError::PoolAlreadySettled)
+            }
             PoolStatus::Voided => return Err(ContractError::PoolAlreadyVoided),
             PoolStatus::Cancelled => return Err(ContractError::PoolIsCancelled),
             PoolStatus::Disputed => return Err(ContractError::PoolIsDisputed),
@@ -5921,6 +6214,15 @@ impl PredinexContract {
             .set(&DataKey::MinSettlementParticipants, &min_participants);
 
         emit_min_settlement_participants_set(&env, old_min, min_participants);
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_min_settlement_participants"),
+            audit_log::AdminActionDetail::SetMinSettlementParticipants(audit_log::AuditSetMinSettlementParticipants {
+                before: old_min,
+                after: min_participants,
+            }),
+        );
         Ok(())
     }
 
@@ -5997,7 +6299,20 @@ impl PredinexContract {
             return Err(ContractError::InvalidOutcome);
         }
 
-        pool.status = PoolStatus::Settled(winning_outcome);
+        // #1416 — A zero dispute window means the resolution is immediately
+        // final (Open → Settled). A positive window opens a time-bounded
+        // dispute window (Open → ResolutionPending) during which challenges may
+        // be submitted and payouts are paused until finalization.
+        let dispute_window = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::DisputeWindow)
+            .unwrap_or(0);
+        if dispute_window == 0 {
+            pool.status = PoolStatus::Settled(winning_outcome);
+        } else {
+            pool.status = PoolStatus::ResolutionPending(winning_outcome);
+        }
         pool.settled = true;
         pool.winning_outcome = Some(winning_outcome);
 
@@ -6074,6 +6389,27 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
+        // #1416 — Store the resolution deadline (settlement_time + dispute_window)
+        // so `finalize_resolution` and `try_auto_finalize` can check whether the
+        // dispute window has elapsed without re-reading the global config. Only
+        // stored when a dispute window is active; pools settled directly to
+        // `Settled` (window == 0) are immediately final and have no deadline.
+        if dispute_window > 0 {
+            let resolution_deadline = env
+                .ledger()
+                .timestamp()
+                .saturating_add(dispute_window);
+            env.storage().persistent().set(
+                &DataKey::PoolResolutionDeadline(pool_id),
+                &resolution_deadline,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::PoolResolutionDeadline(pool_id),
+                POOL_BUMP_THRESHOLD,
+                POOL_BUMP_TARGET,
+            );
+        }
+
         // #176 — emit enriched settlement event including source metadata.
         emit_settle_pool(
             env,
@@ -6092,9 +6428,21 @@ impl PredinexContract {
 
     /// Settle an expired pool by declaring the winning outcome.
     ///
-    /// Transitions the pool from `Open` to `Settled(winning_outcome)`, fixes the
-    /// market's protocol fee (computed as `floor(bps × total volume)`), records
-    /// the settlement source, and emits a `settle_pool` event. After settlement,
+    /// When the configured dispute window is **zero** (`set_dispute_window(0)`),
+    /// the resolution is immediately final: the pool transitions directly from
+    /// `Open` to `Settled(winning_outcome)` and winners may claim right away.
+    ///
+    /// When the dispute window is **positive**, the pool transitions from `Open`
+    /// to `ResolutionPending(winning_outcome)`, a non-final state that opens a
+    /// time-bounded dispute window. The resolution becomes final (`Settled`)
+    /// once the dispute window elapses without a challenge — either via
+    /// [`finalize_resolution`](Self::finalize_resolution) or automatically when
+    /// a winner attempts to claim. During the window any authorised party may
+    /// challenge via [`dispute_pool`](Self::dispute_pool).
+    ///
+    /// Fixes the market's protocol fee (computed as `floor(bps × total volume)`),
+    /// records the settlement source, stores the resolution deadline (when a
+    /// window is active), and emits a `settle_pool` event. After finalization,
     /// winners call [`claim_winnings`](Self::claim_winnings). The caller must be
     /// the pool creator or a delegated settler assigned via
     /// [`assign_settler`](Self::assign_settler).
@@ -6173,6 +6521,103 @@ impl PredinexContract {
         }
     }
 
+    /// #1416 — Finalize a pending resolution, transitioning the pool from
+    /// `ResolutionPending` to `Settled` after the dispute window has elapsed.
+    ///
+    /// Callable by **anyone** — no authorization required. The function verifies
+    /// that the pool is in `ResolutionPending` status and that the dispute window
+    /// deadline has passed. If a challenge was recorded (the pool is `Disputed`),
+    /// finalization is rejected.
+    ///
+    /// This is the explicit entry point for finalization. Claims also
+    /// auto-finalize expired pending resolutions via [`try_auto_finalize`](Self::try_auto_finalize),
+    /// so calling this function is only necessary when no winner is ready to claim.
+    ///
+    /// # Arguments
+    /// * `pool_id` – pool to finalize.
+    ///
+    /// # Errors
+    /// * `PoolNotFound` – pool does not exist.
+    /// * `ResolutionNotPending` – pool is not in `ResolutionPending` status.
+    /// * `ResolutionNotFinal` – dispute window has not yet elapsed.
+    ///
+    /// # Events
+    /// Emits `resolution_finalized` with `auto = false`.
+    pub fn finalize_resolution(env: Env, pool_id: u32) -> Result<(), ContractError> {
+        Self::finalize_resolution_internal(&env, pool_id, None, false)
+    }
+
+    /// #1416 — Internal finalization logic shared by the public
+    /// `finalize_resolution` entry point and the auto-finalize claim path.
+    ///
+    /// * `finalizer` – `Some(address)` when triggered by an explicit call,
+    ///   `None` when auto-triggered by a claim path.
+    /// * `auto` – `true` when triggered by a claim, `false` for explicit calls.
+    fn finalize_resolution_internal(
+        env: &Env,
+        pool_id: u32,
+        finalizer: Option<Address>,
+        auto: bool,
+    ) -> Result<(), ContractError> {
+        let mut pool = env
+            .storage()
+            .persistent()
+            .get::<_, Pool>(&DataKey::Pool(pool_id))
+            .ok_or(ContractError::PoolNotFound)?;
+
+        let winning_outcome = match pool.status {
+            PoolStatus::ResolutionPending(o) => o,
+            _ => return Err(ContractError::ResolutionNotPending),
+        };
+
+        let deadline = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::PoolResolutionDeadline(pool_id))
+            .ok_or(ContractError::ResolutionNotPending)?;
+
+        if env.ledger().timestamp() < deadline {
+            return Err(ContractError::ResolutionNotFinal);
+        }
+
+        pool.status = PoolStatus::Settled(winning_outcome);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pool(pool_id), &pool);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Pool(pool_id),
+            POOL_BUMP_THRESHOLD,
+            POOL_BUMP_TARGET,
+        );
+
+        emit_resolution_finalized(env, pool_id, winning_outcome, finalizer, auto);
+        Ok(())
+    }
+
+    /// #1416 — Auto-finalize a pending resolution if the dispute window has
+    /// elapsed. Called by both claim paths (`claim_winnings_internal` and
+    /// `claim_multi_asset_winnings`) before reading the pool, so that claims
+    /// against an expired `ResolutionPending` pool proceed without requiring
+    /// a separate `finalize_resolution` transaction.
+    ///
+    /// If the pool is `ResolutionPending` and the deadline has passed, the pool
+    /// is finalized to `Settled` in storage. If the deadline has not passed,
+    /// returns `ResolutionNotFinal`. If the pool is in any other status, this
+    /// is a no-op.
+    fn try_auto_finalize(env: &Env, pool_id: u32) -> Result<(), ContractError> {
+        let pool = env
+            .storage()
+            .persistent()
+            .get::<_, Pool>(&DataKey::Pool(pool_id))
+            .ok_or(ContractError::PoolNotFound)?;
+
+        if !matches!(pool.status, PoolStatus::ResolutionPending(_)) {
+            return Ok(());
+        }
+
+        Self::finalize_resolution_internal(env, pool_id, None, true)
+    }
+
     /// #176 — Return the settlement source for a pool, or `None` if not yet settled.
     pub fn get_settlement_source(env: Env, pool_id: u32) -> Option<SettlementSource> {
         env.storage()
@@ -6215,7 +6660,13 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
-        emit_void_pool(&env, pool_id, caller);
+        emit_void_pool(&env, pool_id, caller.clone());
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "void_pool"),
+            audit_log::AdminActionDetail::VoidPool(audit_log::AuditVoidPool { pool_id }),
+        );
         Ok(())
     }
 
@@ -6685,6 +7136,11 @@ impl PredinexContract {
         {
             return Err(ContractError::MultiAssetClaimRequired);
         }
+
+        // #1416 — Auto-finalize an expired ResolutionPending pool before
+        // proceeding with the claim. If the dispute window has not elapsed,
+        // this returns ResolutionNotFinal, blocking the claim.
+        Self::try_auto_finalize(env, pool_id)?;
 
         let pool = env
             .storage()
@@ -7269,10 +7725,10 @@ impl PredinexContract {
     ///
     /// Delegates each pool to `claim_winnings_internal` so that all safety
     /// invariants, CEI ordering, analytics updates (UserTotalClaimed /
-    /// UserClaimHistory), multi-asset guards, and fee/dust accounting are
-    /// handled in one canonical place. Pools that are ineligible (not settled,
-    /// no winning bet, already claimed, multi-asset) are silently skipped so a
-    /// partial batch never reverts the whole transaction.
+    /// UserClaimHistory), fee/dust accounting, and single-/multi-asset payout
+    /// handling are kept in their canonical paths. Pools that are ineligible
+    /// (not settled, no winning bet, or already claimed) are recorded as
+    /// skipped errors so a partial batch never reverts the whole transaction.
     ///
     /// Returns a vec of `ClaimAllEntry` (pool_id + amount transferred) for every
     /// pool from which tokens were actually sent. An empty vec means nothing was
@@ -7299,22 +7755,20 @@ impl PredinexContract {
                 None => continue,
             };
 
-            // Skip multi-asset pools — callers must use claim_multi_asset_winnings.
-            if env
+            let is_multi_asset = env
                 .storage()
                 .persistent()
                 .get::<_, bool>(&DataKey::PoolIsMultiAsset(pool_id))
-                .unwrap_or(false)
-            {
-                results.push_back(ClaimAllEntry {
-                    pool_id,
-                    amount: 0,
-                    error_code: ContractError::MultiAssetClaimRequired as u32,
-                });
-                continue;
-            }
+                .unwrap_or(false);
 
-            match Self::claim_winnings_internal(&env, user.clone(), pool_id) {
+            let result = if is_multi_asset {
+                Self::claim_multi_asset_winnings(env.clone(), user.clone(), pool_id)
+                    .map(|claim| claim.total_normalized)
+            } else {
+                Self::claim_winnings_internal(&env, user.clone(), pool_id)
+            };
+
+            match result {
                 Ok(amount) => {
                     results.push_back(ClaimAllEntry {
                         pool_id,
@@ -7618,6 +8072,16 @@ impl PredinexContract {
         {
             return Err(ContractError::InvalidRateLimitConfig);
         }
+        let before_max: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TreasuryWithdrawalMaxPerWindow)
+            .unwrap_or(0);
+        let before_window: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TreasuryWithdrawalWindowSecs)
+            .unwrap_or(0);
         env.storage().persistent().set(
             &DataKey::TreasuryWithdrawalMaxPerWindow,
             &max_withdrawal_per_window,
@@ -7630,6 +8094,17 @@ impl PredinexContract {
             .persistent()
             .remove(&DataKey::TreasuryWithdrawalState);
         emit_treasury_withdraw_limit_set(&env, max_withdrawal_per_window, withdrawal_window_secs);
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_treasury_withdraw_limit"),
+            audit_log::AdminActionDetail::SetTreasuryWithdrawLimit(audit_log::AuditSetTreasuryWithdrawLimit {
+                before_max,
+                before_window_secs: before_window,
+                after_max: max_withdrawal_per_window,
+                after_window_secs: withdrawal_window_secs,
+            }),
+        );
         Ok(())
     }
 
@@ -7673,7 +8148,16 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::TreasuryRecipient, &new_recipient);
 
-        emit_treasury_recipient_rotated(&env, current_recipient, new_recipient);
+        emit_treasury_recipient_rotated(&env, current_recipient.clone(), new_recipient.clone());
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "rotate_treasury_recipient"),
+            audit_log::AdminActionDetail::RotateTreasuryRecipient(audit_log::AuditRotateTreasuryRecipient {
+                old_recipient: current_recipient,
+                new_recipient,
+            }),
+        );
         Ok(())
     }
 
@@ -7783,6 +8267,12 @@ impl PredinexContract {
             .set(&DataKey::TreasuryToken(token_address), &(current_main_treasury - amount));
 
         emit_treasury_withdrawn(&env, caller.clone(), treasury_recipient, amount);
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "withdraw_treasury"),
+            audit_log::AdminActionDetail::WithdrawTreasury(audit_log::AuditWithdrawTreasury { amount }),
+        );
         Ok(())
     }
 
@@ -7801,7 +8291,16 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::FreezeAdmin, &freeze_admin);
 
-        emit_freeze_admin_set(&env, old_freeze_admin, freeze_admin);
+        emit_freeze_admin_set(&env, old_freeze_admin.clone(), freeze_admin.clone());
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_freeze_admin"),
+            audit_log::AdminActionDetail::SetFreezeAdmin(audit_log::AuditSetFreezeAdmin {
+                old_freeze_admin,
+                new_freeze_admin: freeze_admin,
+            }),
+        );
         Ok(())
     }
 
@@ -7818,7 +8317,13 @@ impl PredinexContract {
         let old_admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
         env.storage().persistent().set(&DataKey::Admin, &admin);
 
-        emit_admin_set(&env, old_admin, admin);
+        emit_admin_set(&env, old_admin.clone(), admin.clone());
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_admin"),
+            audit_log::AdminActionDetail::SetAdmin(audit_log::AuditSetAdmin { old_admin, new_admin: admin }),
+        );
         Ok(())
     }
 
@@ -7842,7 +8347,13 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::PendingAdmin, &new_admin);
 
-        emit_admin_proposed(&env, caller, new_admin);
+        emit_admin_proposed(&env, caller.clone(), new_admin.clone());
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "propose_admin"),
+            audit_log::AdminActionDetail::ProposeAdmin(audit_log::AuditProposeAdmin { proposed: new_admin }),
+        );
         Ok(())
     }
 
@@ -7872,7 +8383,13 @@ impl PredinexContract {
         env.storage().persistent().set(&DataKey::Admin, &caller);
         env.storage().persistent().remove(&DataKey::PendingAdmin);
 
-        emit_admin_set(&env, old_admin, caller);
+        emit_admin_set(&env, old_admin.clone(), caller.clone());
+        audit_log::append(
+            &env,
+            caller.clone(),
+            Symbol::new(&env, "accept_admin"),
+            audit_log::AdminActionDetail::AcceptAdmin(audit_log::AuditAcceptAdmin { old_admin, new_admin: caller }),
+        );
         Ok(())
     }
 
@@ -7921,7 +8438,13 @@ impl PredinexContract {
         );
 
         emit_pool_frozen(&env, pool_id, caller.clone());
-        emit_market_paused(&env, pool_id, caller, env.ledger().timestamp());
+        emit_market_paused(&env, pool_id, caller.clone(), env.ledger().timestamp());
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "freeze_pool"),
+            audit_log::AdminActionDetail::FreezePool(audit_log::AuditFreezePool { pool_id }),
+        );
         Ok(())
     }
 
@@ -7929,7 +8452,7 @@ impl PredinexContract {
         env.storage()
             .persistent()
             .get(&DataKey::DisputeWindow)
-            .unwrap_or(DISPUTE_WINDOW_SECS)
+            .unwrap_or(0)
     }
 
     /// #1407 — Return the outcome index that was under dispute when the pool
@@ -7940,6 +8463,39 @@ impl PredinexContract {
             .get(&DataKey::PoolDisputedOutcome(pool_id))
     }
 
+    /// #1416 — Return all recorded challenges against a pool's pending
+    /// resolution, or an empty vector if none have been recorded.
+    pub fn get_pool_challenges(env: Env, pool_id: u32) -> Vec<Challenge> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PoolChallenges(pool_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// #1416 — Return the resolution deadline (ledger timestamp) after which a
+    /// `ResolutionPending` pool can be finalized, or `None` if the pool has not
+    /// been settled.
+    pub fn get_resolution_deadline(env: Env, pool_id: u32) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PoolResolutionDeadline(pool_id))
+    }
+
+    /// #1416 — Configure the contract-wide dispute window in seconds.
+    ///
+    /// When set to **0** (the default if never configured), pool resolutions
+    /// are immediately final — `settle_pool` transitions directly to `Settled`
+    /// and winners may claim right away (no dispute window).
+    ///
+    /// When set to a **positive** value, `settle_pool` transitions to
+    /// `ResolutionPending` and the resolution is not final until the window
+    /// elapses without a challenge. During the window, authorised parties may
+    /// call `dispute_pool` to challenge the resolution. After the window,
+    /// `finalize_resolution` (or an auto-finalize on claim) transitions the
+    /// pool to `Settled`.
+    ///
+    /// Only the freeze admin may call this. The value applies to all future
+    /// `settle_pool` calls. Emits `dispute_window_set`.
     pub fn set_dispute_window(
         env: Env,
         caller: Address,
@@ -7947,15 +8503,32 @@ impl PredinexContract {
     ) -> Result<(), ContractError> {
         caller.require_auth();
         Self::require_freeze_admin(&env, &caller)?;
+        let before: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeWindow)
+            .unwrap_or(0);
         env.storage()
             .persistent()
             .set(&DataKey::DisputeWindow, &window_secs);
         emit_dispute_window_set(&env, window_secs);
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_dispute_window"),
+            audit_log::AdminActionDetail::SetDisputeWindow(audit_log::AuditSetDisputeWindow { before, after: window_secs }),
+        );
         Ok(())
     }
 
-    /// Mark a settled pool as disputed, blocking claim payouts pending review.
-    /// Callable only by the freeze admin.
+    /// Mark a settled or resolution-pending pool as disputed, blocking claim
+    /// payouts pending review. Callable only by the freeze admin.
+    ///
+    /// #1416 — When the pool is in `ResolutionPending` status, the dispute is
+    /// recorded as a **challenge** against the pending resolution. The
+    /// challenger address and timestamp are appended to `PoolChallenges` and a
+    /// `resolution_challenged` event is emitted alongside the legacy
+    /// `pool_disputed` event.
     pub fn dispute_pool(env: Env, caller: Address, pool_id: u32) -> Result<(), ContractError> {
         caller.require_auth();
         Self::require_freeze_admin(&env, &caller)?;
@@ -7970,7 +8543,7 @@ impl PredinexContract {
             return Err(ContractError::PoolIsFrozen);
         }
 
-        if !matches!(pool.status, PoolStatus::Settled(_)) {
+        if !matches!(pool.status, PoolStatus::Settled(_) | PoolStatus::ResolutionPending(_)) {
             return Err(ContractError::PoolMustBeSettledToDispute);
         }
 
@@ -7989,7 +8562,7 @@ impl PredinexContract {
                 .storage()
                 .persistent()
                 .get::<_, u64>(&DataKey::DisputeWindow)
-                .unwrap_or(DISPUTE_WINDOW_SECS);
+                .unwrap_or(0);
 
             if env.ledger().timestamp() > settlement_time + dispute_window {
                 return Err(ContractError::DisputeWindowExpired);
@@ -8000,11 +8573,12 @@ impl PredinexContract {
             .persistent()
             .set(&DataKey::PoolPreDisputeStatus(pool_id), &pool.status);
 
-        // #1407 — Extract and persist the settled outcome that is being disputed
-        // so the UI, indexers, and resolvers can identify which resolution is
-        // under review without having to reconstruct it from the pre-dispute status.
+        // #1407 — Extract and persist the outcome that is being disputed so the
+        // UI, indexers, and resolvers can identify which resolution is under
+        // review without having to reconstruct it from the pre-dispute status.
+        // #1416 — Now also handles ResolutionPending pools.
         let disputed_outcome: u32 = match pool.status {
-            PoolStatus::Settled(o) => o,
+            PoolStatus::Settled(o) | PoolStatus::ResolutionPending(o) => o,
             _ => 0,
         };
         env.storage()
@@ -8016,6 +8590,31 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
+        // #1416 — Record the challenge if this is a ResolutionPending pool.
+        let was_resolution_pending = matches!(pool.status, PoolStatus::ResolutionPending(_));
+        if was_resolution_pending {
+            let timestamp = env.ledger().timestamp();
+            let mut challenges: Vec<Challenge> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PoolChallenges(pool_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            challenges.push_back(Challenge {
+                challenger: caller.clone(),
+                timestamp,
+                disputed_outcome,
+            });
+            env.storage()
+                .persistent()
+                .set(&DataKey::PoolChallenges(pool_id), &challenges);
+            env.storage().persistent().extend_ttl(
+                &DataKey::PoolChallenges(pool_id),
+                POOL_BUMP_THRESHOLD,
+                POOL_BUMP_TARGET,
+            );
+            emit_resolution_challenged(&env, pool_id, caller.clone(), disputed_outcome, timestamp);
+        }
+
         pool.status = PoolStatus::Disputed;
         env.storage()
             .persistent()
@@ -8026,7 +8625,13 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
-        emit_pool_disputed(&env, pool_id, caller, disputed_outcome);
+        emit_pool_disputed(&env, pool_id, caller.clone(), disputed_outcome);
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "dispute_pool"),
+            audit_log::AdminActionDetail::DisputePool(audit_log::AuditDisputePool { pool_id }),
+        );
         Ok(())
     }
 
@@ -8080,11 +8685,15 @@ impl PredinexContract {
             POOL_BUMP_TARGET,
         );
 
-        // #1309 — tagged Admin so consumers can distinguish this from a bettor's
-        // bet auto-thawing a pool whose cooling period had elapsed.
         emit_pool_unfrozen(&env, pool_id, caller.clone(), UnfreezeTrigger::Admin, had_cooling_deadline);
         // #1449 — emit MarketUnpaused domain event for market resumption
-        emit_market_unpaused(&env, pool_id, caller, env.ledger().timestamp());
+        emit_market_unpaused(&env, pool_id, caller.clone(), env.ledger().timestamp());
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "unfreeze_pool"),
+            audit_log::AdminActionDetail::UnfreezePool(audit_log::AuditUnfreezePool { pool_id }),
+        );
         Ok(())
     }
 
@@ -8147,7 +8756,13 @@ impl PredinexContract {
             .persistent()
             .remove(&DataKey::PoolCoolingUntil(pool_id));
 
-        emit_pool_cooling_overridden(&env, pool_id, caller);
+        emit_pool_cooling_overridden(&env, pool_id, caller.clone());
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "override_pool_cooling"),
+            audit_log::AdminActionDetail::OverridePoolCooling(audit_log::AuditOverridePoolCooling { pool_id }),
+        );
         Ok(())
     }
 
@@ -9170,10 +9785,16 @@ impl PredinexContract {
         env.storage().persistent().set(&DataKey::Paused, &paused);
 
         if paused {
-            emit_contract_paused(&env, caller);
+            emit_contract_paused(&env, caller.clone());
         } else {
-            emit_contract_unpaused(&env, caller);
+            emit_contract_unpaused(&env, caller.clone());
         }
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_paused"),
+            audit_log::AdminActionDetail::SetPaused(audit_log::AuditSetPaused { paused }),
+        );
         Ok(())
     }
 
@@ -9185,7 +9806,13 @@ impl PredinexContract {
         Self::require_admin_or_treasury_recipient(&env, &caller)?;
         env.storage().persistent().set(&DataKey::Paused, &true);
         emit_contract_paused(&env, caller.clone());
-        emit_pool_paused(&env, caller);
+        emit_pool_paused(&env, caller.clone());
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "pause_contract"),
+            audit_log::AdminActionDetail::SetPaused(audit_log::AuditSetPaused { paused: true }),
+        );
         Ok(())
     }
 
@@ -9197,7 +9824,13 @@ impl PredinexContract {
         Self::require_admin_or_treasury_recipient(&env, &caller)?;
         env.storage().persistent().set(&DataKey::Paused, &false);
         emit_contract_unpaused(&env, caller.clone());
-        emit_pool_unpaused(&env, caller);
+        emit_pool_unpaused(&env, caller.clone());
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "unpause_contract"),
+            audit_log::AdminActionDetail::SetPaused(audit_log::AuditSetPaused { paused: false }),
+        );
         Ok(())
     }
 
@@ -9263,18 +9896,20 @@ impl PredinexContract {
                 Some(_) => ClaimStatus::RefundClaimable,
                 None => ClaimStatus::AlreadyClaimed,
             },
-            PoolStatus::Settled(winning_outcome) => match bet {
-                None => ClaimStatus::AlreadyClaimed,
-                Some(b) => {
-                    let outcome_bets = Self::read_user_outcome_bets(&env, pool_id, user, &b);
-                    let winning_stake = outcome_bets.get(winning_outcome).unwrap_or(0);
-                    if winning_stake > 0 {
-                        ClaimStatus::Claimable
-                    } else {
-                        ClaimStatus::NotEligible
+            PoolStatus::Settled(winning_outcome) | PoolStatus::ResolutionPending(winning_outcome) => {
+                match bet {
+                    None => ClaimStatus::AlreadyClaimed,
+                    Some(b) => {
+                        let outcome_bets = Self::read_user_outcome_bets(&env, pool_id, user, &b);
+                        let winning_stake = outcome_bets.get(winning_outcome).unwrap_or(0);
+                        if winning_stake > 0 {
+                            ClaimStatus::Claimable
+                        } else {
+                            ClaimStatus::NotEligible
+                        }
                     }
                 }
-            },
+            }
             _ => match bet {
                 Some(_) => ClaimStatus::NotEligible,
                 None => ClaimStatus::NeverBet,
@@ -9412,7 +10047,7 @@ impl PredinexContract {
         };
 
         let winning_outcome = match pool.status {
-            PoolStatus::Settled(outcome) => outcome,
+            PoolStatus::Settled(outcome) | PoolStatus::ResolutionPending(outcome) => outcome,
             PoolStatus::Voided | PoolStatus::Cancelled => {
                 // For voided/cancelled pools, return the user's total bet as refund
                 let bet: UserBet = match env
@@ -9544,7 +10179,13 @@ impl PredinexContract {
             .get(&DataKey::ReferralBps)
             .unwrap_or(0);
         env.storage().persistent().set(&DataKey::ReferralBps, &bps);
-        emit_referral_bps_set(&env, caller, old_bps, bps);
+        emit_referral_bps_set(&env, caller.clone(), old_bps, bps);
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "set_referral_bps"),
+            audit_log::AdminActionDetail::SetReferralBps(audit_log::AuditSetReferralBps { before: old_bps, after: bps }),
+        );
         Ok(())
     }
 
@@ -9782,6 +10423,14 @@ impl PredinexContract {
         );
 
         emit_webhook_registered(&env, url, event_types.len());
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "register_webhook"),
+            audit_log::AdminActionDetail::RegisterWebhook(audit_log::AuditRegisterWebhook {
+                url_redacted: audit_log::redacted(&env),
+            }),
+        );
         Ok(())
     }
 
@@ -10580,6 +11229,11 @@ impl PredinexContract {
     ) -> Result<MultiAssetClaimResult, ContractError> {
         Self::require_claim_auth(&env, &user)?;
 
+        // #1416 — Auto-finalize an expired ResolutionPending pool before
+        // proceeding with the claim. If the dispute window has not elapsed,
+        // this returns ResolutionNotFinal, blocking the claim.
+        Self::try_auto_finalize(&env, pool_id)?;
+
         let pool = env
             .storage()
             .persistent()
@@ -11041,8 +11695,13 @@ impl PredinexContract {
 
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &to, &amount);
 
-        emit_tokens_rescued(&env, token, to, amount);
-
+        emit_tokens_rescued(&env, token.clone(), to.clone(), amount);
+        audit_log::append(
+            &env,
+            caller,
+            Symbol::new(&env, "rescue_tokens"),
+            audit_log::AdminActionDetail::RescueTokens(audit_log::AuditRescueTokens { token, to, amount }),
+        );
         Ok(())
     }
 
